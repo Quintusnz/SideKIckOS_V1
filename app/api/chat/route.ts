@@ -20,8 +20,8 @@ const extractAssistantText = (item: AgentInputItem) => {
   if ((item as any).role !== "assistant") return "";
   const content = (item as any).content ?? [];
   return content
-    .filter((part: any) => part?.type === "output_text")
-    .map((part: any) => part.text)
+    .filter((part: any) => part?.type === "output_text" || part?.type === "text")
+    .map((part: any) => (typeof part === "string" ? part : part.text ?? ""))
     .join("")
     .trim();
 };
@@ -113,18 +113,24 @@ export async function POST(request: NextRequest) {
       },
     });
 
+    const previousLength = session.history.length;
     const historyWithUser = [...session.history, userItem];
     const result = await runner.run(orchestratorAgent, historyWithUser, { context: session.context });
-    const history = result.history;
+    const history = result.history as AgentInputItem[];
     updateSessionHistory(threadId, history);
 
-    const newItems = result.newItems.map((item) => item.rawItem as AgentInputItem);
-    const assistantMessages = newItems
+    const newHistoryItems = history.slice(previousLength);
+    const assistantMessages = newHistoryItems
+      .filter((item) => (item as any)?.role === "assistant")
       .map((item) => extractAssistantText(item))
       .filter((text) => text.length > 0);
 
-    const textResponse = assistantMessages.join("\n\n");
-    const parts = extractDeliverableParts(newItems);
+    const toolItems = newHistoryItems.filter((item) => (item as any)?.type === "function_call_result");
+    const responseFallback = Array.isArray((result as any)?.response?.output_text)
+      ? ((result as any).response.output_text as string[]).join("").trim()
+      : "";
+    const textResponse = assistantMessages.join("\n\n") || responseFallback;
+    const parts = extractDeliverableParts(toolItems as AgentInputItem[]);
 
     return createSseResponse({
       id: `msg-${Date.now()}`,
