@@ -1,4 +1,4 @@
-﻿import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { Runner, type AgentInputItem, OpenAIProvider } from "@openai/agents";
 import { orchestratorAgent } from "@/server/agents/agents/orchestrator";
 import { getOrCreateSession, updateSessionHistory } from "@/server/agents/conversation-store";
@@ -21,7 +21,7 @@ const extractAssistantText = (item: AgentInputItem) => {
   const content = (item as any).content ?? [];
   return content
     .filter((part: any) => part?.type === "output_text")
-    .map((part: any) => part.text)
+    .map((part: any) => part.text ?? "")
     .join("")
     .trim();
 };
@@ -38,18 +38,33 @@ const extractDeliverableParts = (items: AgentInputItem[]) => {
   }> = [];
 
   for (const item of items) {
-    if ((item as any).type === "function_call_result" && (item as any).name === "draft_email") {
-      const output = (item as any).output;
-      if (output?.type === "text" && typeof output.text === "string") {
+    if ((item as any).type !== "function_call_result" || (item as any).name !== "draft_email") continue;
+
+    const output = (item as any).output;
+    let parsed: any;
+
+    if (typeof output === "string") {
+      try {
+        parsed = JSON.parse(output);
+      } catch (error) {
+        console.error("Failed to parse draft_email tool output", error);
+        continue;
+      }
+    } else if (output && typeof output === "object") {
+      if ((output as any).type === "text" && typeof (output as any).text === "string") {
         try {
-          const parsed = JSON.parse(output.text);
-          if (parsed?.subject && parsed?.body) {
-            deliverables.push(parsed);
-          }
+          parsed = JSON.parse((output as any).text);
         } catch (error) {
           console.error("Failed to parse draft_email tool output", error);
+          continue;
         }
+      } else {
+        parsed = output;
       }
+    }
+
+    if (parsed?.subject && parsed?.body) {
+      deliverables.push(parsed);
     }
   }
 
@@ -118,7 +133,8 @@ export async function POST(request: NextRequest) {
     const history = result.history;
     updateSessionHistory(threadId, history);
 
-    const newItems = result.newItems.map((item) => item.rawItem as AgentInputItem);
+    const newItemsStartIndex = historyWithUser.length;
+    const newItems = history.slice(newItemsStartIndex);
     const assistantMessages = newItems
       .map((item) => extractAssistantText(item))
       .filter((text) => text.length > 0);
@@ -137,3 +153,4 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Chat orchestrator failed." }, { status: 500 });
   }
 }
+
