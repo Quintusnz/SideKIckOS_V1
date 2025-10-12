@@ -1,0 +1,39 @@
+{
+    "name": "sidekick-os",
+    "version": "0.1.0",
+    "private": true,
+    "scripts": {
+        "dev": "next dev",
+        "build": "next build",
+        "start": "next start",
+        "lint": "next lint",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run"
+    },
+    "dependencies": {
+        "@openai/agents": "^0.1.9",
+        "@openai/agents-core": "^0.1.8",
+        "ai": "^3.3.0",
+        "clsx": "^2.1.1",
+        "date-fns": "^3.6.0",
+        "lucide-react": "^0.446.0",
+        "next": "^15.0.0",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "recharts": "^2.12.6",
+        "tailwind-merge": "^2.5.3",
+        "zustand": "^4.5.2"
+    },
+    "devDependencies": {
+        "@tailwindcss/postcss": "^4.1.14",
+        "@types/node": "^22.7.5",
+        "@types/react": "^18.3.5",
+        "@types/react-dom": "^18.3.0",
+        "autoprefixer": "^10.4.21",
+        "eslint": "^9.11.0",
+        "eslint-config-next": "^15.0.0",
+        "tailwindcss": "4.0.0-alpha.22",
+        "typescript": "^5.6.3",
+        "vitest": "^3.2.4"
+    }
+}

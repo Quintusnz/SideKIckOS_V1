@@ -1,0 +1,363 @@
+Here’s a single, end-to-end agent flow that deliberately exercises basically every major feature of the OpenAI Agents SDK (handoffs, tools, Zod output types, context passing, guardrails, memory, traces, file & web use, code execution, idempotent reporting, and atomic turns).
+
+All-Features Agent Flow: “RFP Response Copilot”
+Scenario
+
+A user wants help responding to a government RFP. They:
+
+Paste a prompt, upload two PDFs (RFP + compliance guide) and a CSV (historical KPIs).
+
+Want: a research brief with citations, a risk register, a costing table derived from the CSV, and a reply email to the contracting officer.
+
+Must pass guardrails (moderation/PII), and the draft must respect the user’s style preferences stored in memory.
+
+What SDK features this flow uses
+
+Multiple agents with handoffs (Orchestrator → Triage → Research → Data Analysis → Synthesis → Email).
+
+Built-in tools: webSearchTool, codeInterpreterTool.
+
+Custom tools: search_web, fetch_content, report_result (idempotent).
+
+Zod: structured outputs from Triage, Plan, and Deliverable schemas.
+
+Runner with traceMetadata and message store.
+
+Context passing via RunContext.
+
+Guardrails pre-check on user input.
+
+Atomic turns (no assistant text in same turn as handoffs/finalizing tool calls).
+
+Telemetry (step updates), truncation, dedupe, error handling, memory (style preferences).
+
+1) Topology (at a glance)
+User → Guardrails → Orchestrator
+                  ↳ Triage (Zod: have_docs?, user_goal, deadline)
+                    ↳ If missing docs → GetDocs agent (asks for 2 PDFs + CSV)
+                    ↳ Else:
+                      Research (webSearchTool + custom search_web/fetch_content)
+                      Data Analysis (codeInterpreterTool parses CSV → KPIs/plots)
+                      Synthesis (report_result -> research-brief deliverable)
+                      Email Draft Builder (report_result -> email-draft deliverable)
+
+2) Core Schemas (Zod)
+import { z } from "zod";
+
+export const TriageSchema = z.object({
+  have_two_pdfs: z.boolean(),
+  have_kpi_csv: z.boolean(),
+  user_goal: z.string(),
+  deadline: z.string().optional(),
+});
+
+export const ResearchBriefSchema = z.object({
+  briefTitle: z.string().min(4),
+  summary: z.string().min(20),
+  keyFindings: z.array(z.object({ title: z.string().min(3), insight: z.string().min(5) })).min(2),
+  citations: z.array(z.object({ label: z.string().min(2), url: z.string().url(), snippet: z.string().nullable() })).min(1),
+  recommendations: z.array(z.string()).nullable(),
+  riskRegister: z.array(z.object({
+    risk: z.string(),
+    likelihood: z.enum(["low","med","high"]),
+    impact: z.enum(["low","med","high"]),
+    mitigation: z.string()
+  })).min(1),
+  costing: z.object({
+    method: z.string(),
+    rows: z.array(z.object({ item: z.string(), qty: z.number(), unit: z.string(), unitCost: z.number(), total: z.number() })),
+    totals: z.object({ subtotal: z.number(), tax: z.number(), grandTotal: z.number() })
+  })
+});
+
+export const EmailDraftSchema = z.object({
+  subject: z.string().min(3),
+  body: z.string().min(10),
+  variants: z.array(z.object({ label: z.string().min(3), body: z.string().min(5) })).max(4).default([]),
+  tone: z.string().nullable().optional(),
+  callToAction: z.string().nullable().optional(),
+});
+
+3) Tools (built-in + custom)
+
+Built-ins (from SDK):
+
+import { webSearchTool, codeInterpreterTool } from "@openai/agents";
+
+const webSearch = webSearchTool({ searchContextSize: "medium", userLocation: { type: "approximate" }});
+const codeInterpreter = codeInterpreterTool({ container: { type: "auto", file_ids: [] }});
+
+
+Custom (search_web, fetch_content, report_result) — defensive, dedupe, truncation, idempotency. (Use your runtime versions you’ve already got; below are minimal signatures.)
+
+import { tool } from "@openai/agents";
+import { z } from "zod";
+
+// Custom web search proxy (if you have your own provider)
+export const search_web = tool<{ runId: string }>({
+  name: "search_web",
+  description: "High-signal search returning title/url/snippet",
+  parameters: z.object({ query: z.string().min(3) }),
+  async execute({ query }, runCtx) {
+    // startStep(...); try { performSearch; dedupe; completeStep(...) } catch {...}
+    return "1. Title\nURL: https://...\nSnippet: ...";
+  },
+});
+
+// Fetch content for a discovered source (your fetcher)
+export const fetch_content = tool<{ runId: string }>({
+  name: "fetch_content",
+  description: "Fetches full text for a URL (truncated)",
+  parameters: z.object({ url: z.string().url(), title: z.string().nullable() }),
+  async execute({ url, title }, runCtx) {
+    // startStep(...); try { fetchContent; truncate; completeStep(...) } catch {...}
+    return "Fetched content text (maybe truncated)";
+  },
+});
+
+// Finalizer — normalized, idempotent
+export const report_result = tool<{ runId: string }>({
+  name: "report_result",
+  description: "Call exactly once to record a deliverable; do not emit assistant text in same turn.",
+  parameters: z.any(),
+  async execute(input, runCtx) {
+    // Validate with Zod; normalize variants; set store deliverable; mark steps; return short success text
+    return "Result captured.";
+  },
+});
+
+4) Agents
+Orchestrator (atomic handoffs, no extra text)
+
+Decides the route based on Triage.
+
+Immediately handoffs to the next specialist in the same turn (no assistant text).
+
+import { Agent } from "@openai/agents";
+import { promptWithHandoffInstructions } from "@openai/agents-core/extensions";
+
+export const orchestrator = Agent.create({
+  name: "Orchestrator",
+  handoffDescription: "Routes to Triage / Research / Data / Synthesis / Email.",
+  instructions: () => promptWithHandoffInstructions(
+`You are the Orchestrator.
+Rules:
+- First call the Triage agent.
+- If Triage says docs missing → handoff to GetDocs agent.
+- Else handoff to Research, then Data Analysis, then Synthesis, then Email.
+- Handoffs must be atomic (no assistant text in the same turn).`
+  ),
+  handoffs: [/* triage, getDocs, research, dataAnalysis, synthesis, email */],
+  model: "gpt-5",
+  modelSettings: { reasoning: { effort: "high" }, text: { verbosity: "medium" } }
+});
+
+Triage (structured output via Zod)
+
+Checks whether two PDFs + one CSV exist, and pulls user goal/deadline.
+
+import { Agent } from "@openai/agents";
+import { TriageSchema } from "./schemas";
+
+export const triage = new Agent({
+  name: "Triage",
+  instructions: `From conversation (including uploads), detect:
+- have_two_pdfs, have_kpi_csv, user_goal, deadline.
+Use the provided schema.`,
+  outputType: TriageSchema,
+  model: "gpt-5",
+  modelSettings: { reasoning: { effort: "minimal" }, store: true }
+});
+
+GetDocs (asks for uploads)
+
+Lightweight, just asks for the missing artifacts.
+
+export const getDocs = new Agent({
+  name: "GetDocs",
+  instructions: "Ask user to upload TWO PDFs (RFP + compliance) and ONE CSV (KPIs). Be specific and concise.",
+  model: "gpt-4.1-nano",
+  modelSettings: { store: true }
+});
+
+Research (web search + custom tools; citations)
+
+Uses webSearchTool and optionally your custom search_web + fetch_content.
+
+Gathers current regulatory notes + competitor context and extracts key points.
+
+import { Agent } from "@openai/agents";
+import { webSearch } from "./tools";
+import { search_web, fetch_content, report_result } from "./custom-tools";
+
+export const research = new Agent({
+  name: "Research",
+  instructions: `Research the RFP domain; summarize with citations [label](url).
+Use webSearch; fetch_content for depth. Do NOT call report_result yet.`,
+  tools: [webSearch, search_web, fetch_content],
+  model: "gpt-5",
+  modelSettings: { reasoning: { effort: "high" }, store: true }
+});
+
+Data Analysis (code interpreter on CSV)
+
+Runs analysis (AOV, win rate, capacity), returns a compact summary table and optionally charts.
+
+Produces structured block (to be merged during Synthesis).
+
+import { Agent } from "@openai/agents";
+import { codeInterpreter } from "./tools";
+
+export const dataAnalysis = new Agent({
+  name: "Data Analysis",
+  instructions: `Load the uploaded KPI CSV. Compute cost baseline, throughput, and pricing inputs.
+If you create figures, also describe them in text. Return a structured JSON block.`,
+  tools: [codeInterpreter],
+  model: "gpt-5",
+  modelSettings: { reasoning: { effort: "low" }, store: true }
+});
+
+Synthesis (final research brief deliverable via report_result)
+
+Merges Research + Data outputs.
+
+Validates with ResearchBriefSchema and calls report_result (atomic turn).
+
+import { Agent } from "@openai/agents";
+import { report_result } from "./custom-tools";
+
+export const synthesis = new Agent({
+  name: "Synthesis",
+  instructions: `Combine the web findings + CSV insights into a typed research brief:
+- Include riskRegister and costing from the CSV analysis.
+- Validate against ResearchBriefSchema.
+- Call report_result with type "research-brief".
+- Atomic turn: do not emit normal assistant text in the same turn.`,
+  tools: [report_result],
+  model: "gpt-5",
+  modelSettings: {
+    reasoning: { effort: "high" },
+    text: { verbosity: "medium" },
+    // Optional: outputType: ResearchBriefSchema  (you can validate in tool, too)
+  }
+});
+
+Email Draft Builder (final email via report_result)
+
+Pulls style preferences from memory (your memoryGraph/runtime).
+
+Calls report_result with email-draft payload (atomic turn).
+
+export const email = new Agent({
+  name: "Email Draft Builder",
+  instructions: `Draft a reply to the contracting officer:
+- Respect style prefs from memory.
+- Provide subject/body and 2–3 variants.
+- Call report_result with type "email-draft". Atomic turn.`,
+  tools: [report_result],
+  model: "gpt-5-mini",
+  modelSettings: { reasoning: { effort: "low" }, text: { verbosity: "low" }, store: true }
+});
+
+5) Guardrails (pre-check)
+import { OpenAI } from "openai";
+import { runGuardrails } from "@openai/guardrails";
+
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const guardrailsConfig = { guardrails: [{ name: "Moderation", config: { categories: ["sexual","hate","violence"] }}]};
+const context = { guardrailLlm: client };
+
+async function guard(userText: string) {
+  const res = await runGuardrails(userText, guardrailsConfig, context);
+  const tripped = (res ?? []).some(r => r?.tripwireTriggered);
+  if (tripped) return { ok: false, redacted: /* choose checked/anonymized */ userText };
+  return { ok: true, redacted: userText };
+}
+
+6) Runner Orchestration (trace + context + atomic handoffs)
+import { Runner, AgentInputItem } from "@openai/agents";
+import { orchestrator, triage, getDocs, research, dataAnalysis, synthesis, email } from "./agents";
+import { createWorkflowContext } from "./runtime";
+
+export async function runRfpFlow({
+  runId, workflow, planSteps, intent, userText, uploadedFileIds
+}: {
+  runId: string; workflow: any; planSteps: string[]; intent: string; userText: string; uploadedFileIds: string[];
+}) {
+  // Guardrails first
+  const g = await guard(userText);
+  if (!g.ok) return { blocked: true, message: "Content blocked or needs review" };
+
+  const context = createWorkflowContext({ runId, workflow, planSteps, intent });
+  const conversation: AgentInputItem[] = [
+    { role: "user", content: [{ type: "input_text", text: g.redacted }] },
+    // Attach files as items (SDK supports file items in content)
+    ...uploadedFileIds.map(id => ({ role: "user", content: [{ type: "input_file", file_id: id }]})),
+  ];
+
+  const runner = new Runner({
+    defaultModel: "gpt-5",
+    traceMetadata: { workflow_id: workflow?.id ?? "rfp", run_id: runId, scenario: "rfp-copilot" }
+  });
+
+  // Triaging
+  const t1 = await runner.run(triage, conversation, { context });
+  conversation.push(...t1.newItems.map(i => i.rawItem));
+  if (!t1.finalOutput) throw new Error("Triage failed");
+  const triaged = t1.finalOutput;
+
+  if (!triaged.have_two_pdfs || !triaged.have_kpi_csv) {
+    // Ask for docs
+    const docs = await runner.run(getDocs, conversation, { context });
+    conversation.push(...docs.newItems.map(i => i.rawItem));
+    return { need_uploads: true };
+  }
+
+  // Research
+  const r = await runner.run(research, conversation, { context });
+  conversation.push(...r.newItems.map(i => i.rawItem));
+
+  // Data analysis (code interpreter consumes CSV via uploaded files)
+  const d = await runner.run(dataAnalysis, conversation, { context });
+  conversation.push(...d.newItems.map(i => i.rawItem));
+
+  // Synthesis (calls report_result atomically)
+  const s = await runner.run(synthesis, conversation, { context });
+  conversation.push(...s.newItems.map(i => i.rawItem));
+
+  // Email draft (calls report_result atomically)
+  const e = await runner.run(email, conversation, { context });
+  conversation.push(...e.newItems.map(i => i.rawItem));
+
+  return { ok: true };
+}
+
+7) Why this hits “everything”
+
+Zod output types: Triage + Deliverables.
+
+Tools: both built-in (webSearchTool, codeInterpreterTool) and custom (search_web, fetch_content, report_result).
+
+Handoffs: Orchestrator routes to each specialist without extra assistant text (atomic turns).
+
+Runner with traceMetadata and store enabled for traceability.
+
+Context passing and memory (style preferences) honored in Email agent.
+
+Guardrails stop or sanitize input before the run.
+
+Telemetry + defensive tool code: step updates, dedupe, truncation, idempotency.
+
+Files: PDFs and CSV are attached as input items; code interpreter consumes the CSV, research/fetch tools cite and fetch sources.
+
+8) Pro Tips
+
+Keep orchestrator prompts tiny; offload logic to Zod outputs from specialists.
+
+Make finalization tools (like report_result) idempotent and keep those turns atomic.
+
+Cap large tool outputs (8–20k chars) and prefer summaries.
+
+Always set traceMetadata with IDs you actually use in your logs.
+
+For files: ensure the agent that needs them comes after they’re added to the conversation.

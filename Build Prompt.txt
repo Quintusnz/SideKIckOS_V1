@@ -1,0 +1,370 @@
+Here’s the tightened Option-A prompt with the **chat route stub** and a **Recharts client-only wrapper** added. You can paste this whole thing into your code-gen model.
+
+---
+
+# SideKick OS Front-End (Option A: SDK UI Primitives Wrapped by shadcn/Tailwind)
+
+You are implementing the SideKick OS front-end from scratch. Deliver a **Next.js 15 (App Router) + TypeScript** project that matches the current production UI’s layout, tokens, copy and interactions. Use the **Vercel AI SDK v5** chat primitives for messages & composer, and wrap them with our shell/components (shadcn/Tailwind) for layout and theming. Do **not** re-implement chat logic.
+
+## 0) Tooling & Dependencies (pin reasonable versions)
+
+* Next.js 15, TypeScript, ESLint
+* Tailwind CSS **v4 preview** (`@import "tailwindcss";`)
+* shadcn/ui (Card/Button/Input/Skeleton/ScrollArea)
+* State: **Zustand**
+* Icons: **lucide-react**
+* Charts: **recharts** (client-only; dynamic import with `ssr: false`)
+* AI chat: **Vercel AI SDK v5** → `import { useChat } from "ai/react"`
+* Fonts: **Geist Sans/Mono** via `next/font/google` with CSS vars
+
+**package.json (core)**
+
+```json
+{
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ai": "^3.3.0",
+    "lucide-react": "^0.446.0",
+    "recharts": "^2.12.6",
+    "zustand": "^4.5.2",
+    "clsx": "^2.1.1"
+  },
+  "devDependencies": {
+    "tailwindcss": "4.0.0-alpha.22",
+    "typescript": "^5.6.3",
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "eslint": "^9.11.0"
+  }
+}
+```
+
+> **Do not** include `@openai/agents*` in the frontend; that stays server-side.
+
+## 1) Global styling & tokens
+
+`app/globals.css`
+
+```css
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --background: #0f111a;
+  --foreground: #edf2f4;
+  --surface-elevated: #161a2a;
+  --surface-muted: #2b2d42;
+  --surface-accent: #ef233c;
+  --surface-accent-strong: #d90429;
+  --font-geist-sans: var(--font-geist-sans);
+  --font-geist-mono: var(--font-geist-mono);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface-muted: var(--surface-muted);
+  --color-surface-accent: var(--surface-accent);
+  --color-surface-accent-strong: var(--surface-accent-strong);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+```
+
+**Fonts wiring (`app/layout.tsx`)**
+
+```tsx
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+
+const geistSans = Geist({ subsets: ["latin"], variable: "--font-geist-sans" });
+const geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-geist-mono" });
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable}`}>
+      <body>{children}</body>
+    </html>
+  );
+}
+```
+
+## 2) App shell (three panes)
+
+* Outer shell: `div.flex.h-screen.overflow-hidden.bg-[#0f111a].text-zinc-100`
+* Left aside nav (width 16rem ↔ 4rem), `border-r border-white/5 bg-[#101526]`
+* Main: `bg-gradient-to-b from-[#101526] to-[#0f111a] p-6 max-w-5xl mx-auto`
+* Right aside activity pane (22rem open, 0 when hidden)
+* PaneToggle buttons (8x8) `PanelLeftClose`/`PanelRightClose`, transitions `transition-all duration-200`
+
+## 3) Navigation
+
+Routes & icons:
+`/dashboard` Gauge, `/` Home, `/workflows` Workflow, `/knowledge` Archive, `/settings` Settings
+Active: `bg-[#2B2D42]/70 text-zinc-100`
+Inactive: `text-zinc-100/70 hover:bg-[#2B2D42]/50`
+Brand row: `LayoutGrid` (accent `#EF233C`) + “SideKick OS”
+Footer (12px): “Concurrent runs supported… (exact copy)”
+
+## 4) State (Zustand)
+
+* `store/ui.ts`: `{ navCollapsed, activityCollapsed, focusedRunId, toggleNav(), toggleActivity(), setFocusedRun(id?) }`
+* `store/runs.ts`: `{ runs: RunSummary[], lastEvent?, upsertRun(), applyEvent(), reset() }`
+* `hooks/useActivitiesStream.ts`: `EventSource( runId ? "/api/activities/stream?runId=..." : "/api/activities/stream")` → `applyEvent`.
+
+## 5) Data models
+
+* `models/activity.ts`: `ActivityStatus`, `ActivityRun`, `ActivityStepLog`, `RunSummary`, `ActivityEvent`
+* `models/workflow.ts`: `WorkflowDefinition`, `WorkflowStepDef`
+* `types/ui.ts`: `AppUIMessage = UIMessage<unknown, { 'agent-output': { agentName?: string; text: string } }>` (forward compat)
+
+## 6) Workbench (`app/page.tsx`) — **SDK chat primitives**
+
+```tsx
+"use client";
+import { useChat } from "ai/react";
+import { Card } from "@/components/ui/card";
+
+export default function WorkbenchPage() {
+  const { messages, input, setInput, handleSubmit, isLoading, stop } = useChat({ api: "/api/chat" });
+
+  return (
+    <div className="flex h-full flex-col gap-6 overflow-hidden">
+      <header className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold tracking-wide uppercase">Conversational Workbench</h1>
+      </header>
+
+      <section className="flex-1 overflow-y-auto pr-2">
+        <div className="space-y-4">
+          {messages.map(m => (
+            <Card key={m.id} className="p-4 bg-[#12172a] border border-white/5">
+              <div className="text-xs uppercase tracking-widest opacity-70 mb-2">
+                {m.role === "user" ? "You" : "SideKick"}
+              </div>
+              <div className="whitespace-pre-wrap">{m.content}</div>
+            </Card>
+          ))}
+          {isLoading && (
+            <div className="text-sm opacity-80 flex items-center gap-2">
+              <span className="h-2 w-2 rounded-full bg-[#ef233c] animate-pulse" /> Streaming response…
+            </div>
+          )}
+        </div>
+      </section>
+
+      <form onSubmit={handleSubmit} className="border-t border-white/5 pt-4">
+        <div className="flex gap-2">
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            placeholder="Describe what you need and press Enter"
+            className="flex-1 h-12 rounded-md bg-[#161a2a] px-3 outline-none focus:ring-2 focus:ring-[#EF233C]"
+            aria-label="Chat input"
+          />
+          <button
+            type="submit"
+            disabled={isLoading || !input.trim()}
+            className="h-12 px-4 rounded-md bg-gradient-to-r from-[#EF233C] to-[#D90429] disabled:opacity-50"
+            aria-label="Send message"
+          >
+            Send
+          </button>
+          {isLoading && (
+            <button type="button" onClick={stop} className="h-12 px-3 rounded-md bg-[#2b2d42]">
+              Stop
+            </button>
+          )}
+        </div>
+        <p className="mt-2 text-xs opacity-70">Enter to send · Shift+Enter for newline</p>
+      </form>
+    </div>
+  );
+}
+```
+
+## 7) **Chat Route Stub** (`app/api/chat/route.ts`)
+
+Server endpoint for `useChat({ api: "/api/chat" })`. Streams plain text so the UI shows live tokens. Keep providers/secrets server-side.
+
+```ts
+// app/api/chat/route.ts
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+export async function POST(req: Request) {
+  const { messages, input } = await req.json();
+
+  const text = `You said: ${input ?? messages?.at(-1)?.content ?? ""}`;
+  const encoder = new TextEncoder();
+
+  const stream = new ReadableStream({
+    start(controller) {
+      let i = 0;
+      const id = setInterval(() => {
+        if (i >= text.length) {
+          clearInterval(id);
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoder.encode(text[i++]));
+      }, 15);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Transfer-Encoding": "chunked"
+    }
+  });
+}
+```
+
+## 8) Right activity column
+
+* `components/runs-tray.tsx`: fetch `GET /api/runs` on mount → pills (status dot + title + progress) → `setFocusedRun(id)`
+* `components/activity-feed.tsx`: uses `useActivitiesStream(focusedRunId)`; empty state if none; otherwise fetch `/api/runs/{id}` and render step cards + progress (with loading/error states)
+
+## 9) Dashboard + **Recharts (client-only)**
+
+**Client chart wrapper** `components/StatusChart.tsx`
+
+```tsx
+"use client";
+import { Bar, BarChart, CartesianGrid, Tooltip, XAxis, YAxis, ResponsiveContainer } from "recharts";
+
+type Props = { data: Array<{ status: string; count: number }> };
+
+export default function StatusChart({ data }: Props) {
+  return (
+    <div className="h-64">
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={data}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="status" />
+          <YAxis allowDecimals={false} />
+          <Tooltip />
+          <Bar dataKey="count" />
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+```
+
+**Dynamic import in page** `app/dashboard/page.tsx`
+
+```tsx
+import dynamic from "next/dynamic";
+const StatusChart = dynamic(() => import("@/components/StatusChart"), { ssr: false });
+
+export default function DashboardPage() {
+  const data = [
+    { status: "Running", count: 3 },
+    { status: "Done", count: 14 },
+    { status: "Error", count: 1 },
+  ];
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-xl font-semibold tracking-wide uppercase">Operational Dashboard</h1>
+      <StatusChart data={data} />
+    </div>
+  );
+}
+```
+
+## 10) Other pages
+
+* **Workflows**: `GET /api/plugins/registry` → cards with PlayCircle (“Queue Run”, no-op)
+* **Knowledge**: simple upload → `POST /api/uploads { name, content }` → status text
+* **Settings**: model toggle (gpt-5-mini/gpt-5/gpt-5-nano), observability toggle
+
+## 11) API stubs (deterministic mocks)
+
+Create lightweight route handlers so the UI runs end-to-end:
+
+* `app/api/runs/route.ts`: `GET { runs: RunSummary[] }`
+* `app/api/runs/[runId]/route.ts`: `GET { run: ActivityRun }`
+* `app/api/activities/stream/route.ts`: **SSE** emitting an `ActivityEvent` every few seconds
+
+  ```ts
+  // top of file
+  export const runtime = "nodejs";
+  export const dynamic = "force-dynamic";
+  ```
+* `app/api/plugins/registry/route.ts`: workflows list
+* `app/api/uploads/route.ts`: accept POST, return `{ documentId: string }`
+
+## 12) Accessibility & keyboard
+
+* Icon-only controls include `aria-label`; pane toggles use `aria-pressed`
+* Focus styles: `focus-visible:ring-2 focus-visible:ring-[#EF233C]`
+* Chat input: Enter=send, Shift+Enter=newline (works with `useChat` submit)
+
+## 13) Project structure
+
+```
+app/
+  layout.tsx
+  globals.css
+  page.tsx                 // workbench
+  dashboard/page.tsx
+  workflows/page.tsx
+  knowledge/page.tsx
+  settings/page.tsx
+  settings/admin/observability/page.tsx
+  settings/admin/observability/[runId]/page.tsx
+  api/chat/route.ts
+  api/runs/route.ts
+  api/runs/[runId]/route.ts
+  api/activities/stream/route.ts
+  api/plugins/registry/route.ts
+  api/uploads/route.ts
+components/
+  app-shell.tsx
+  navigation.tsx
+  pane-toggle.tsx
+  runs-tray.tsx
+  activity-feed.tsx
+  dashboard-grid.tsx
+  dashboard-widget.tsx
+  StatusChart.tsx
+hooks/
+  useActivitiesStream.ts
+models/
+  activity.ts
+  workflow.ts
+store/
+  ui.ts
+  runs.ts
+types/
+  ui.ts
+utils/
+  cn.ts
+```
+
+## 14) Deliverables
+
+* All files above, runnable with `npm i && npm run dev`
+* Match tokens, copy, and layout (minor spacing variance OK)
+* Lint & typecheck pass
+* README with install/run and mock API behavior
+
+**Guardrails**
+
+* Keep chat rendering generic (Option A).
+* Charts are client-only; dynamic import with `ssr:false`.
+* SSE routes use `runtime="nodejs"` and `dynamic="force-dynamic"`.
+* Avoid importing server-only libs into client components.
