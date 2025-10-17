@@ -1,6 +1,7 @@
 ﻿"use client";
 
-import { useChat } from "ai/react";
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport } from "ai";
 import { Loader2, Send } from "lucide-react";
 import { FormEvent, KeyboardEvent, useMemo, useRef, useState } from "react";
 import { cn } from "@/utils/cn";
@@ -20,14 +21,23 @@ type EmailDraftDeliverable = {
   identicalToExisting?: boolean;
 };
 
+type EmailDraftUIPart = {
+  type: "data-email-draft";
+  id?: string;
+  data: EmailDraftDeliverable;
+};
+
+type TextPart = {
+  type: "text";
+  text: string;
+  state?: "streaming" | "done";
+};
+
 type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";
-  content: string;
-  parts?: Array<{
-    type: "email-draft";
-    deliverable: EmailDraftDeliverable;
-  }>;
+  content?: string;
+  parts?: Array<TextPart | EmailDraftUIPart>;
 };
 
 type CopyState = {
@@ -38,15 +48,25 @@ type CopyState = {
 const initialCopyState: CopyState = { label: "Copy", recent: false };
 
 export function ChatPanel() {
-  const { messages, input, handleInputChange, handleSubmit, isLoading } = useChat({ api: "/api/chat" });
+  const { messages, sendMessage, status } = useChat({
+    transport: new DefaultChatTransport({ api: "/api/chat" }),
+  });
   const typedMessages = messages as ChatMessage[];
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [copyState, setCopyState] = useState<Record<string, CopyState>>({});
+  const [input, setInput] = useState("");
+  const isLoading = status !== "ready";
 
   const onSubmit = (event: FormEvent<HTMLFormElement>) => {
-    handleSubmit(event);
+    event.preventDefault();
+    const trimmed = input.trim();
+    if (!trimmed) return;
+
+    void sendMessage({ text: trimmed });
+    setInput("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
+      handleInput(textareaRef.current);
     }
   };
 
@@ -62,6 +82,17 @@ export function ChatPanel() {
     if (!element) return;
     element.style.height = "auto";
     element.style.height = `${Math.min(element.scrollHeight, 180)}px`;
+  };
+
+  const extractTextContent = (message: ChatMessage) => {
+    if (message.content) return message.content;
+
+    if (!Array.isArray(message.parts)) return "";
+
+    return message.parts
+      .filter((part): part is TextPart => part?.type === "text" && typeof (part as TextPart).text === "string")
+      .map((part) => part.text)
+      .join("");
   };
 
   const copyToClipboard = async (id: string, content: string) => {
@@ -126,7 +157,7 @@ export function ChatPanel() {
         {typedMessages.length === 0 && emptyState}
         {typedMessages.map((message) => {
           const isUser = message.role === "user";
-          const deliverableParts = message.parts?.filter((part) => part.type === "email-draft");
+          const deliverableParts = message.parts?.filter((part): part is EmailDraftUIPart => part.type === "data-email-draft");
 
           return (
             <div key={message.id} className="space-y-3">
@@ -136,10 +167,10 @@ export function ChatPanel() {
                   isUser ? "ml-auto bg-[#ef233c] text-white" : "bg-[#101526] text-zinc-100",
                 )}
               >
-                <p className="whitespace-pre-wrap leading-relaxed">{message.content}</p>
+                <p className="whitespace-pre-wrap leading-relaxed">{extractTextContent(message)}</p>
               </div>
               {!isUser && deliverableParts?.map((part, index) => {
-                const deliverable = part.deliverable;
+                const deliverable = part.data;
                 return (
                   <div
                     key={`${message.id}-deliverable-${index}`}
@@ -192,7 +223,7 @@ export function ChatPanel() {
             value={input}
             onKeyDown={handleKeyDown}
             onChange={(event) => {
-              handleInputChange(event);
+              setInput(event.currentTarget.value);
               handleInput(event.currentTarget);
             }}
             placeholder="Ask the orchestrator..."
