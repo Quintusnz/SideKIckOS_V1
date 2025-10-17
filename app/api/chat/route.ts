@@ -67,6 +67,181 @@ type OrchestratorUIMessage = UIMessage & {
   parts?: EmailDraftPart[];
 };
 
+type ToolInteraction = {
+  id: string;
+  name: string;
+  status: "started" | "completed" | "error";
+  arguments?: unknown;
+  result?: unknown;
+};
+
+type ReasoningStep = {
+  title: string;
+  detail: string;
+};
+
+type SourceItem = {
+  id: string;
+  title: string;
+  description?: string;
+  url?: string;
+  badge?: string;
+};
+
+const safeParseJSON = (value: unknown) => {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+};
+
+const normalizeDetail = (detail: string) => detail.trim().replace(/\s+/g, " ");
+
+const extractToolInteractions = (items: AgentInputItem[]): ToolInteraction[] => {
+  const calls = new Map<string, ToolInteraction>();
+  let generatedId = 0;
+
+  for (const item of items) {
+    const candidate = item as any;
+    const type = candidate?.type;
+    if (!type) continue;
+
+    if (type === "function_call_arguments") {
+      const id = String(candidate.call_id ?? candidate.id ?? `tool-${generatedId++}`);
+      const name = candidate.name ?? candidate.tool_name ?? "tool";
+      const rawArguments = candidate.arguments ?? candidate.args ?? candidate.input ?? candidate.content;
+      const parsedArguments = safeParseJSON(
+        typeof rawArguments === "string"
+          ? rawArguments
+          : (rawArguments?.text ?? rawArguments?.input_text ?? rawArguments),
+      );
+
+      calls.set(id, {
+        id,
+        name,
+        status: "started",
+        arguments: parsedArguments,
+      });
+    }
+
+    if (type === "function_call_result") {
+      const id = String(candidate.call_id ?? candidate.id ?? candidate.result_id ?? `tool-${generatedId++}`);
+      const name = candidate.name ?? candidate.tool_name ?? "tool";
+      const rawOutput = candidate.output ?? candidate.result ?? candidate.data ?? candidate.content;
+      const parsedOutput = safeParseJSON(
+        typeof rawOutput === "string"
+          ? rawOutput
+          : (rawOutput?.text ?? rawOutput?.output_text ?? rawOutput),
+      );
+
+      const existing = calls.get(id) ?? { id, name, status: "started" as const };
+      calls.set(id, {
+        ...existing,
+        name,
+        status: "completed",
+        result: parsedOutput,
+      });
+    }
+  }
+
+  return Array.from(calls.values());
+};
+
+const buildReasoning = (
+  userText: string,
+  toolCalls: ToolInteraction[],
+  deliverable: EmailDraftDeliverable | undefined,
+): ReasoningStep[] => {
+  const steps: ReasoningStep[] = [];
+
+  if (userText) {
+    const preview = userText.length > 160 ? `${userText.slice(0, 157)}…` : userText;
+    steps.push({
+      title: "Understand operator request",
+      detail: normalizeDetail(`Parsed the latest prompt: “${preview}”`),
+    });
+  }
+
+  const draftCall = toolCalls.find((call) => call.name === "draft_email");
+  if (draftCall) {
+    const argsSummary = (() => {
+      const args = draftCall.arguments as Record<string, unknown> | undefined;
+      if (!args || typeof args !== "object") return undefined;
+      const { recipient, tone, keyPoints } = args as {
+        recipient?: string;
+        tone?: string;
+        keyPoints?: unknown;
+      };
+      const points = Array.isArray(keyPoints) ? keyPoints.length : undefined;
+      const parts: string[] = [];
+      if (recipient && typeof recipient === "string") parts.push(`recipient ${recipient}`);
+      if (tone && typeof tone === "string") parts.push(`tone ${tone}`);
+      if (typeof points === "number") parts.push(`${points} key points`);
+      return parts.join(", ");
+    })();
+
+    steps.push({
+      title: "Delegate to drafting specialist",
+      detail: normalizeDetail(
+        argsSummary
+          ? `Called draft_email with ${argsSummary}.`
+          : "Triggered draft_email with structured context.",
+      ),
+    });
+  }
+
+  if (deliverable) {
+    const { metadata, variants, subject } = deliverable;
+    const variantCount = Array.isArray(variants) ? variants.length : 0;
+    const keyPointCount = Array.isArray(metadata?.keyPoints) ? metadata.keyPoints.length : 0;
+    steps.push({
+      title: "Assemble final response",
+      detail: normalizeDetail(
+        `Prepared subject “${subject}”, rephrased ${variantCount + 1} variants, and reflected ${keyPointCount} key points.`,
+      ),
+    });
+  }
+
+  return steps;
+};
+
+const buildSources = (
+  deliverable: EmailDraftDeliverable | undefined,
+  toolCalls: ToolInteraction[],
+  threadId: string,
+): SourceItem[] => {
+  if (!deliverable) return [];
+
+  const keyPoints = Array.isArray(deliverable.metadata?.keyPoints)
+    ? (deliverable.metadata?.keyPoints as string[])
+    : [];
+
+  const sourcesFromKeyPoints: SourceItem[] = keyPoints.map((point, index) => ({
+    id: `${deliverable.runId ?? threadId}-kp-${index}`,
+    title: point,
+    description: "Key point supplied by the operator",
+    url: `https://sidekick.local/runs/${deliverable.runId ?? threadId}#kp-${index + 1}`,
+    badge: "Operator context",
+  }));
+
+  const draftCall = toolCalls.find((call) => call.name === "draft_email");
+  const toolSource: SourceItem[] = draftCall
+    ? [
+        {
+          id: `${deliverable.runId ?? threadId}-tool-${draftCall.id}`,
+          title: "Draft email specialist",
+          description: "Specialist agent synthesis for email formatting",
+          url: `https://sidekick.local/runs/${deliverable.runId ?? threadId}`,
+          badge: "Specialist",
+        },
+      ]
+    : [];
+
+  return [...sourcesFromKeyPoints, ...toolSource];
+};
+
 const extractDeliverableParts = (items: AgentInputItem[]): EmailDraftPart[] | undefined => {
   const deliverables: EmailDraftDeliverable[] = [];
 
@@ -195,6 +370,47 @@ export async function POST(request: NextRequest) {
           }
 
           const deliverableParts = extractDeliverableParts(newItems);
+          const toolInteractions = extractToolInteractions(newItems);
+          const primaryDeliverable = deliverableParts?.[0]?.deliverable;
+
+          const reasoningSteps = buildReasoning(userText, toolInteractions, primaryDeliverable);
+          if (reasoningSteps.length > 0) {
+            writer.write({
+              type: "data-reasoning",
+              id: `${messageId}-reasoning`,
+              data: {
+                headline: "How the orchestrator responded",
+                steps: reasoningSteps,
+              },
+            });
+          }
+
+          if (toolInteractions.length > 0) {
+            toolInteractions.forEach((interaction, index) => {
+              writer.write({
+                type: "data-tool",
+                id: `${messageId}-tool-${index}`,
+                data: {
+                  name: interaction.name,
+                  status: interaction.status,
+                  arguments: interaction.arguments,
+                  result: interaction.result,
+                },
+              });
+            });
+          }
+
+          if (primaryDeliverable) {
+            const sources = buildSources(primaryDeliverable, toolInteractions, threadId);
+            if (sources.length > 0) {
+              writer.write({
+                type: "data-sources",
+                id: `${messageId}-sources`,
+                data: sources,
+              });
+            }
+          }
+
           if (deliverableParts?.length) {
             deliverableParts.forEach((part, index) => {
               writer.write({

@@ -1,24 +1,18 @@
 ﻿# Repository Guidelines
 
 ## Project Structure & Module Organization
-- pp/: Next.js App Router pages, layouts, and API mocks. Feature folders (dashboard/, settings/, etc.) keep UI, routes, and handlers co-located.
+- app/: Next.js App Router pages, layouts, and API mocks. Feature folders (dashboard/, settings/, etc.) keep UI, routes, and handlers co-located.
 - components/: Reusable client components (chat panel, shell, widgets). Keep feature-specific state outside this directory.
 - store/, hooks/, models/, data/: Shared Zustand state, streaming helpers, types, and deterministic fixtures backing the UI.
-- 	ests/: Vitest suites (*.test.ts) targeting stores and utilities. Add new files mirroring source names.
+- tests/: Vitest suites (*.test.ts) targeting stores and utilities. Add new files mirroring source names.
 
 ## Build, Test, and Development Commands
-- 
-pm run dev — Start the Next.js 15 dev server with Tailwind v4 preview and mock APIs.
-- 
-pm run build — Generate the production bundle; run before release branches.
-- 
-pm run start — Serve the compiled bundle for smoke testing.
-- 
-pm run test — Execute Vitest suites in CI-friendly mode.
-- 
-pm run lint — ESLint (Next preset) for React/TypeScript code health.
-- 
-pm run typecheck — Strict TypeScript validation without emit.
+- `npm run dev` — Start the Next.js 15 dev server with Tailwind v4 preview and mock APIs.
+- `npm run build` — Generate the production bundle; run before release branches.
+- `npm run start` — Serve the compiled bundle for smoke testing.
+- `npm run test` — Execute Vitest suites in CI-friendly mode.
+- `npm run lint` — ESLint (Next preset) for React/TypeScript code health.
+- `npm run typecheck` — Strict TypeScript validation without emit.
 
 ## Coding Style & Naming Conventions
 - TypeScript + functional components only; type props explicitly.
@@ -66,82 +60,158 @@ Here’s a tightened, **drop-in** `agents.md` addition that codifies the hybrid 
 
 ## Message Contract
 
-We carry agent telemetry as **UI-message parts** alongside assistant text. Keep types tiny and stable.
+Assistant responses stream as a combination of text deltas and typed telemetry parts. These types mirror `components/chat-panel.tsx` and should stay in sync with any backend emitters.
 
 ```ts
-// Shared types
-export type AgentEvent =
-  | { type: 'token';  delta: string }
-  | { type: 'tool';   progress: { tool: string; status: 'started' | 'delta' | 'completed' | 'error'; data?: unknown } }
-  | { type: 'handoff'; from: string; to: string; reason?: string }
-  | { type: 'trace';  runId: string; step: string; meta?: Record<string, unknown> }
-  | { type: 'final';  message: string; annotations?: Record<string, unknown> };
+export type TextPart = {
+  type: "text";
+  text: string;
+  state?: "streaming" | "done";
+};
 
-export type UIMessage = {
+export type ReasoningUIPart = {
+  type: "data-reasoning";
+  id?: string;
+  data: {
+    headline?: string;
+    steps: Array<{ title: string; detail: string }>;
+  };
+};
+
+export type ToolUIPart = {
+  type: "data-tool";
+  id?: string;
+  data: {
+    name: string;
+    status: "started" | "completed" | "error";
+    arguments?: unknown;
+    result?: unknown;
+  };
+};
+
+export type SourcesUIPart = {
+  type: "data-sources";
+  id?: string;
+  data: Array<{
+    id: string;
+    title: string;
+    description?: string;
+    url?: string;
+    badge?: string;
+  }>;
+};
+
+export type EmailDraftUIPart = {
+  type: "data-email-draft";
+  id?: string;
+  data: {
+    subject: string;
+    body: string;
+    variants: Array<{ label: string; body: string }>;
+    metadata: Record<string, unknown>;
+    cacheKey: string;
+    runId: string;
+    identicalToExisting?: boolean;
+  };
+};
+
+export type MessagePart =
+  | TextPart
+  | ReasoningUIPart
+  | ToolUIPart
+  | SourcesUIPart
+  | EmailDraftUIPart;
+
+export type ChatMessage = {
   id: string;
-  role: 'user' | 'assistant' | 'system';
-  content: string;          // Plain text content (concatenate deltas server-side)
-  parts?: AgentEvent[];     // Agent events for SideKick panes (runs, activity)
-  threadId?: string;
-  runId?: string;
+  role: "user" | "assistant" | "system";
+  content?: string;
+  parts?: MessagePart[];
 };
 ```
 
+The server always starts a stable text block via `text-start`, streams deltas (`text-delta`), and closes with `text-end`. Each telemetry payload is its own event (`data-reasoning`, `data-tool`, etc.) so the UI can render or collapse sections independently.
+
 ---
 
-## Client (UI): useChat
+## Client (UI): `useChat`
 
 ```tsx
 "use client";
-import { useChat } from "ai/react";
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport } from "ai";
 
 export function WorkbenchChat() {
-  const { messages, input, setInput, handleSubmit, isLoading, stop } =
-    useChat<UIMessage>({ api: "/api/chat" });
+  const { messages, status, sendMessage } = useChat<ChatMessage>({
+    transport: new DefaultChatTransport({ api: "/api/chat" }),
+  });
+
+  const isStreaming = status !== "ready";
 
   // Render with shadcn/ui or AI Elements components
   // (Messages list + Composer wrapped in your app shell)
-  /* ... */
+  // Forward `messages` to the chat panel and count on `status`
+  // for "thinking" indicators or disabling the send button.
 }
 ```
 
-> `useChat` (v5) manages chat state and streaming over a transport; you handle layout/theming. ([ai-sdk.dev][1])
+> `DefaultChatTransport` keeps the UI hook synchronized with `createUIMessageStream`, including typed telemetry events. ([ai-sdk.dev][1])
 
 ---
 
 ## Server Bridge (UI stream): Agents → UI parts
 
-Use **AI SDK v5** helpers to stream UI messages. Maintain **stable IDs** across `text-start` → `text-delta`* → `text-end`.
+Use **AI SDK v5** helpers to stream the orchestrator response. Maintain a stable `id` across `text-start` → `text-delta` → `text-end`, and emit each telemetry payload as the matching `data-*` event.
 
 ```ts
-// app/api/chat/route.ts (Next.js App Router)
-import { createUIMessageStream, createUIMessageStreamResponse, type UIMessage as SDKUIMessage } from "ai";
+import { NextRequest } from "next/server";
+import { Runner, OpenAIProvider } from "@openai/agents";
+import { createUIMessageStream, createUIMessageStreamResponse } from "ai";
+import { orchestratorAgent } from "@/server/agents/agents/orchestrator";
+import { getOrCreateSession, updateSessionHistory } from "@/server/agents/conversation-store";
+// Helper utilities (see app/api/chat/route.ts in this repo)
+import {
+  toUserMessage,
+  extractUserText,
+  writeTextChunks,
+  collectAssistantText,
+  emitReasoning,
+  emitToolTelemetry,
+  emitDeliverables,
+} from "./helpers";
 
-export type MyUIMessage = SDKUIMessage & { parts?: AgentEvent[]; threadId?: string; runId?: string };
+export async function POST(request: NextRequest) {
+  const payload = await request.json();
+  const userText = extractUserText(payload.messages);
+  const { id: sessionId, session } = getOrCreateSession(payload.threadId ?? "default-thread");
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-export async function POST(req: Request) {
-  const { messages, threadId } = await req.json();
-
-  // Run the agents orchestrator and translate its events to UI parts.
-  // Here we stub it with a simple echo & a trace event.
-  const stream = createUIMessageStream<MyUIMessage>({
+  const stream = createUIMessageStream({
     execute: async ({ writer }) => {
-      const id = "assistant-text-1";
+      const messageId = `assistant-text-${Date.now()}`;
+      writer.write({ type: "text-start", id: messageId });
 
-      // Start a text block
-      writer.write({ type: "text-start", id });
+      const provider = new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY! });
+      const runner = new Runner({
+        modelProvider: provider,
+        model: "gpt-5",
+        modelSettings: {
+          reasoning: { effort: "low" },
+          text: { verbosity: "low" },
+        },
+      });
 
-      const text = `Okay — thread ${threadId ?? "new"}. How can I help? `;
-      for (const ch of text) writer.write({ type: "text-delta", id, delta: ch });
+      const historyWithUser = [...session.history, toUserMessage(userText)];
+      const result = await runner.run(orchestratorAgent, historyWithUser, { context: session.context });
+      updateSessionHistory(sessionId, result.history);
 
-      // Optional: attach a trace/telemetry part (rendered in SideKick activity pane)
-      writer.write({ type: "data", value: { parts: [{ type: "trace", runId: "run_123", step: "router:init" }] } });
+      const newItems = result.history.slice(historyWithUser.length);
+      writeTextChunks(writer, messageId, collectAssistantText(newItems));
 
-      // End the text block and close
-      writer.write({ type: "text-end", id });
+      emitReasoning(writer, messageId, newItems, userText);
+      emitToolTelemetry(writer, messageId, newItems);
+      emitDeliverables(writer, messageId, newItems, sessionId);
+
+      writer.write({ type: "text-end", id: messageId });
       writer.close();
     },
   });
@@ -150,93 +220,58 @@ export async function POST(req: Request) {
 }
 ```
 
-> `createUIMessageStream` / `createUIMessageStreamResponse` are the v5 primitives for server→client UI streaming. ([ai-sdk.dev][5])
+`emitReasoning`, `emitToolTelemetry`, and `emitDeliverables` should call `writer.write({ type: "data-reasoning", ... })`, `writer.write({ type: "data-tool", ... })`, and `writer.write({ type: "data-email-draft", ... })` respectively so the client receives strongly typed parts. ([ai-sdk.dev][5])
 
 ---
 
 ## Orchestration: OpenAI Agents SDK
 
-Model the workflow as **Router → Sub-agents** with tools, handoffs, guardrails, and **built-in tracing**. ([openai.github.io][2])
+Define the orchestrator and specialists with the `Agent` class, wire up handoffs, and execute them with a shared `Runner`. ([openai.github.io][2])
 
 ```ts
-import { Agents, Handoff } from "@openai/agents";
+import { Agent, OpenAIProvider, Runner } from "@openai/agents";
+import { draftEmailTool } from "@/server/agents/tools/draft-email";
 
-const support = Agents.create({
-  name: "Support",
-  model: "gpt-4.1-mini",
-  instructions: "Be concise and helpful.",
-  tools: [],
+export const emailDraftAgent = new Agent({
+  name: "Email Specialist",
+  handoffDescription: "Produces executive-ready email drafts.",
+  instructions: "...",
+  model: "gpt-5",
+  tools: [draftEmailTool],
 });
 
-const research = Agents.create({
-  name: "Research",
-  model: "o4-mini",
-  instructions: "Search & summarize.",
-  tools: [],
+export const orchestratorAgent = new Agent({
+  name: "SideKick Orchestrator",
+  instructions: "Primary assistant; routes work to specialists and summarizes outcomes.",
+  handoffs: [emailDraftAgent],
+  tools: [draftEmailTool],
+  model: "gpt-5",
+  modelSettings: {
+    reasoning: { effort: "low" },
+    text: { verbosity: "low" },
+  },
 });
 
-const router = Agents.create({
-  name: "Router",
-  model: "gpt-4.1",
-  instructions: "Route by intent.",
-  tools: [Handoff.to(support), Handoff.to(research)],
-});
+const provider = new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY! });
+const runner = new Runner({ modelProvider: provider, model: "gpt-5" });
 
-// Streaming run; forward events to the UI stream writer
-export async function runAgentGraphStream(call: { messages: UIMessage[]; threadId?: string }, h: {
-  onToken: (delta: string) => void;
-  onTool: (p: AgentEvent['progress']) => void;
-  onHandoff: (e: Omit<Extract<AgentEvent,{type:'handoff'}>,'type'>) => void;
-  onTrace: (runId: string, step: string, meta?: any) => void;
-  onFinal: (msg: string, ann?: any) => void;
-  onError: (err: unknown) => void;
-}) {
-  await Agents.run({
-    entry: router,
-    messages: call.messages,
-    context: { threadId: call.threadId },
-    onEvent(e) {
-      if (e.type === "token")          h.onToken(e.delta);
-      if (e.type === "tool-start")     h.onTool({ tool: e.tool, status: "started" });
-      if (e.type === "tool-delta")     h.onTool({ tool: e.tool, status: "delta", data: e.delta });
-      if (e.type === "tool-end")       h.onTool({ tool: e.tool, status: "completed", data: e.result });
-      if (e.type === "handoff")        h.onHandoff({ from: e.from, to: e.to, reason: e.reason });
-      if (e.type === "trace")          h.onTrace(e.runId, e.step, e.meta);
-      if (e.type === "error")          h.onError(e.error);
-      if (e.type === "final")          h.onFinal(e.message, e.annotations);
-    },
-  });
-}
+const result = await runner.run(orchestratorAgent, historyWithUser, { context: sessionContext });
 ```
 
-> The Agents SDK exposes **handoffs**, **guardrails**, and **tracing**; inspect runs in the OpenAI Traces dashboard. ([openai.github.io][6])
+The `Runner` records every handoff, tool call, and assistant turn in `result.history`, which we transform into UI message parts for the stream.
 
 ---
 
 ## Wiring the Bridge
 
-Replace the stubbed text in the route with a call to `runAgentGraphStream`, forwarding events into the UI stream:
+`app/api/chat/route.ts` already performs the bridge:
 
-```ts
-const stream = createUIMessageStream<MyUIMessage>({
-  execute: async ({ writer }) => {
-    const id = "assistant-text-1";
-    writer.write({ type: "text-start", id });
+- prime a `messageId` and wrap every response in `text-start` → `text-delta` → `text-end` events;
+- project `Runner` history into reasoning/tool/source/email parts with the helpers noted above;
+- call `writer.write({ type: "data-reasoning" | "data-tool" | ... })` for each structured payload so the UI renders dedicated cards;
+- keep the message part union and the UI renderers in sync whenever you introduce a new telemetry type.
 
-    await runAgentGraphStream({ messages, threadId }, {
-      onToken:  d => writer.write({ type: "text-delta", id, delta: d }),
-      onTool:   p => writer.write({ type: "data", value: { parts: [{ type: "tool", progress: p }] } }),
-      onHandoff:e => writer.write({ type: "data", value: { parts: [{ type: "handoff", ...e }] } }),
-      onTrace:  (runId, step, meta) => writer.write({ type: "data", value: { parts: [{ type: "trace", runId, step, meta }] } }),
-      onFinal:  (msg) => { writer.write({ type: "text-delta", id, delta: msg }); },
-      onError:  (err) => { writer.write({ type: "text-delta", id, delta: String(err) }); }
-    });
-
-    writer.write({ type: "text-end", id });
-    writer.close();
-  },
-});
-```
+Follow the same pattern if you add additional agent runs (e.g., workflows, research).
 
 ---
 
@@ -261,7 +296,7 @@ const stream = createUIMessageStream<MyUIMessage>({
 
 ## Configuration Flags
 
-* `USE_AGENTS_SDK=true|false` — when false, fall back to provider **Responses** streaming to keep UI functioning.
+*None at present.* Document new flags here when they land.
 
 ---
 
@@ -277,7 +312,7 @@ const stream = createUIMessageStream<MyUIMessage>({
 
 ## One-Page Checklist
 
-* [ ] Client uses `useChat<UIMessage>({ api: "/api/chat" })`. ([ai-sdk.dev][1])
+* [ ] Client uses `useChat<ChatMessage>({ transport: new DefaultChatTransport({ api: "/api/chat" }) })`. ([ai-sdk.dev][1])
 * [ ] Server uses `createUIMessageStream` → `createUIMessageStreamResponse` for streaming. ([ai-sdk.dev][5])
 * [ ] Agents SDK emits events → bridge maps to `parts` and text deltas. ([openai.github.io][2])
 * [ ] Tracing enabled; `runId` attached; `threadId` persisted. ([openai.github.io][6])
