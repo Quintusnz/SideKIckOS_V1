@@ -75,14 +75,19 @@ const runViaOrchestrator = async (
     throw new Error("Missing OPENAI_API_KEY");
   }
 
-  const context = createRuntimeContext({ payload: input, threadId });
+  const context = createRuntimeContext({
+    payload: input,
+    threadId,
+    workflowId: "email-draft",
+    intent: "compose-email",
+  });
   const provider = new OpenAIProvider({ apiKey });
   const runner = new Runner({
     modelProvider: provider,
-    model: 'gpt-5',
+    model: "gpt-5-mini",
     modelSettings: {
-      reasoning: { effort: 'low' },
-      text: { verbosity: 'low' },
+      reasoning: { effort: "low" },
+      text: { verbosity: "low" },
     },
     traceMetadata: {
       workflow_id: context.workflowId,

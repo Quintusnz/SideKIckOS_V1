@@ -2,8 +2,18 @@
 import { notFound } from "next/navigation";
 import { getRun } from "@/data/runs";
 
-export default function ObservabilityRunPage({ params }: { params: { runId: string } }) {
-  const run = getRun(params.runId);
+type ObservabilityRunPageProps = {
+  params?: Promise<{ runId: string }>;
+};
+
+export default async function ObservabilityRunPage({ params }: ObservabilityRunPageProps) {
+  const resolvedParams = ((await params) ?? {}) as { runId?: unknown };
+  const runId = typeof resolvedParams.runId === "string" ? resolvedParams.runId : undefined;
+  if (!runId) {
+    notFound();
+  }
+
+  const run = getRun(runId);
 
   if (!run) {
     notFound();

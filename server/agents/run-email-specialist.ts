@@ -17,13 +17,18 @@ export const runEmailDraftSpecialist = async (
     throw new Error("OPENAI_API_KEY is not configured");
   }
 
-  const context = createRuntimeContext({ payload: input, threadId: options.threadId });
+  const context = createRuntimeContext({
+    payload: input,
+    threadId: options.threadId,
+    workflowId: "email-draft",
+    intent: "compose-email",
+  });
   const provider = new OpenAIProvider({ apiKey });
   const runner = new Runner({
     modelProvider: provider,
-    model: "gpt-5",
+    model: "gpt-5-mini",
     modelSettings: {
-      reasoning: { effort: "medium" },
+      reasoning: { effort: "low" },
       text: { verbosity: "low" },
     },
     traceMetadata: {

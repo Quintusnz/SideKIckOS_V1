@@ -1,8 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Runner, type AgentInputItem, OpenAIProvider } from "@openai/agents";
-import { createUIMessageStream, createUIMessageStreamResponse, type UIMessage } from "ai";
+import { createUIMessageStream, createUIMessageStreamResponse } from "ai";
 import { orchestratorAgent } from "@/server/agents/agents/orchestrator";
 import { getOrCreateSession, updateSessionHistory } from "@/server/agents/conversation-store";
+import {
+  researchBriefDeliverableSchema,
+  researchPlanSchema,
+  type ResearchBriefDeliverable,
+  type ResearchPlan,
+} from "@/models/research";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,16 +22,6 @@ const toUserMessage = (text: string): AgentInputItem => ({
     },
   ],
 });
-
-const extractAssistantText = (item: AgentInputItem) => {
-  if ((item as any).role !== "assistant") return "";
-  const content = (item as any).content ?? [];
-  return content
-    .filter((part: any) => part?.type === "output_text")
-    .map((part: any) => part.text ?? "")
-    .join("")
-    .trim();
-};
 
 const extractIncomingMessageText = (message: unknown): string => {
   if (!message || typeof message !== "object") return "";
@@ -48,45 +44,17 @@ const extractIncomingMessageText = (message: unknown): string => {
     .trim();
 };
 
-type EmailDraftDeliverable = {
-  subject: string;
-  body: string;
-  variants: Array<{ label: string; body: string }>;
-  metadata: Record<string, unknown>;
-  cacheKey: string;
-  runId: string;
-  identicalToExisting: boolean;
+const extractAssistantText = (item: AgentInputItem) => {
+  if ((item as any).role !== "assistant") return "";
+  const content = (item as any).content ?? [];
+  return content
+    .filter((part: any) => part?.type === "output_text")
+    .map((part: any) => part.text ?? "")
+    .join("")
+    .trim();
 };
 
-type EmailDraftPart = {
-  type: "email-draft";
-  deliverable: EmailDraftDeliverable;
-};
-
-type OrchestratorUIMessage = UIMessage & {
-  parts?: EmailDraftPart[];
-};
-
-type ToolInteraction = {
-  id: string;
-  name: string;
-  status: "started" | "completed" | "error";
-  arguments?: unknown;
-  result?: unknown;
-};
-
-type ReasoningStep = {
-  title: string;
-  detail: string;
-};
-
-type SourceItem = {
-  id: string;
-  title: string;
-  description?: string;
-  url?: string;
-  badge?: string;
-};
+const normalizeWhitespace = (value: string) => value.trim().replace(/\s+/g, " ");
 
 const safeParseJSON = (value: unknown) => {
   if (typeof value !== "string") return value;
@@ -97,7 +65,100 @@ const safeParseJSON = (value: unknown) => {
   }
 };
 
-const normalizeDetail = (detail: string) => detail.trim().replace(/\s+/g, " ");
+type ToolInteraction = {
+  id: string;
+  name: string;
+  status: "started" | "completed" | "error";
+  arguments?: unknown;
+  result?: unknown;
+};
+
+type EmailDraftDeliverable = {
+  subject: string;
+  body: string;
+  variants: Array<{ label: string; body: string }>;
+  metadata: Record<string, unknown>;
+  cacheKey: string;
+  runId: string;
+  identicalToExisting?: boolean;
+};
+
+type ResearchBriefPart = {
+  deliverable: ResearchBriefDeliverable;
+  cacheKey: string;
+  runId: string;
+  identicalToExisting?: boolean;
+};
+
+type ResearchPlanPart = {
+  plan: ResearchPlan;
+  runId: string;
+};
+
+type ReasoningStep = {
+  title: string;
+  detail: string;
+};
+
+type SourceItem = {
+  id: string;
+  title: string;
+  description?: string | null;
+  url?: string | null;
+  badge?: string | null;
+};
+
+const extractReasoningText = (item: unknown): string => {
+  if (!item || typeof item !== "object") return "";
+  const candidate = item as { rawItem?: unknown; rawContent?: unknown; content?: unknown; text?: unknown };
+  const raw = candidate.rawItem && typeof candidate.rawItem === "object" ? (candidate.rawItem as any) : candidate;
+
+  if (Array.isArray(raw.rawContent)) {
+    return raw.rawContent
+      .map((entry: any) => (typeof entry?.text === "string" ? entry.text : ""))
+      .join(" ")
+      .trim();
+  }
+
+  if (Array.isArray(raw.content)) {
+    return raw.content
+      .map((entry: any) => {
+        if (typeof entry === "string") return entry;
+        if (typeof entry?.text === "string") return entry.text;
+        if (typeof entry?.input_text === "string") return entry.input_text;
+        return "";
+      })
+      .join(" ")
+      .trim();
+  }
+
+  if (typeof raw.text === "string") {
+    return raw.text.trim();
+  }
+
+  return "";
+};
+
+const collectAssistantText = (items: AgentInputItem[]): string =>
+  items
+    .map((item) => extractAssistantText(item))
+    .filter((text) => text.length > 0)
+    .join("\n\n");
+
+const writeTextChunks = (writer: { write: (chunk: any) => void }, id: string, text: string) => {
+  if (!text) return;
+  const normalized = text.replace(/\r\n/g, "\n");
+  if (!normalized.trim()) {
+    writer.write({ type: "text-delta", id, delta: normalized });
+    return;
+  }
+
+  const chunkSize = 400;
+  for (let index = 0; index < normalized.length; index += chunkSize) {
+    const delta = normalized.slice(index, index + chunkSize);
+    writer.write({ type: "text-delta", id, delta });
+  }
+};
 
 const extractToolInteractions = (items: AgentInputItem[]): ToolInteraction[] => {
   const calls = new Map<string, ToolInteraction>();
@@ -144,62 +205,195 @@ const extractToolInteractions = (items: AgentInputItem[]): ToolInteraction[] => 
         result: parsedOutput,
       });
     }
+
+    if (type === "function_call_error") {
+      const id = String(candidate.call_id ?? candidate.id ?? `tool-${generatedId++}`);
+      const name = candidate.name ?? candidate.tool_name ?? "tool";
+      const existing = calls.get(id) ?? { id, name, status: "started" as const };
+      calls.set(id, {
+        ...existing,
+        name,
+        status: "error",
+      });
+    }
   }
 
   return Array.from(calls.values());
 };
 
-const buildReasoning = (
+const extractEmailDeliverables = (items: AgentInputItem[]): EmailDraftDeliverable[] => {
+  const deliverables: EmailDraftDeliverable[] = [];
+
+  for (const item of items) {
+    const candidate = item as any;
+    if (candidate?.type !== "function_call_result" || candidate?.name !== "draft_email") continue;
+
+    const output = candidate.output ?? candidate.result ?? candidate.data ?? candidate.content;
+    const parsed = safeParseJSON(
+      typeof output === "string"
+        ? output
+        : (output?.text ?? output?.output_text ?? output),
+    );
+
+    if (!parsed || typeof parsed !== "object") continue;
+    const payload = parsed as Partial<EmailDraftDeliverable>;
+    if (!payload.subject || !payload.body || !payload.cacheKey || !payload.runId) continue;
+
+    deliverables.push({
+      subject: payload.subject,
+      body: payload.body,
+      variants: Array.isArray(payload.variants) ? payload.variants : [],
+      metadata: (payload.metadata as Record<string, unknown>) ?? {},
+      cacheKey: payload.cacheKey,
+      runId: payload.runId,
+      identicalToExisting: Boolean(payload.identicalToExisting),
+    });
+  }
+
+  return deliverables;
+};
+
+const extractResearchDeliverables = (items: AgentInputItem[]): ResearchBriefPart[] => {
+  const briefs: ResearchBriefPart[] = [];
+
+  for (const item of items) {
+    const candidate = item as any;
+    if (candidate?.type !== "function_call_result" || candidate?.name !== "report_research") continue;
+
+    const output = candidate.output ?? candidate.result ?? candidate.data ?? candidate.content;
+    const parsed = safeParseJSON(
+      typeof output === "string"
+        ? output
+        : (output?.text ?? output?.output_text ?? output),
+    );
+
+    if (!parsed || typeof parsed !== "object") continue;
+    const payload = parsed as {
+      deliverable?: unknown;
+      cacheKey?: unknown;
+      runId?: unknown;
+      identicalToExisting?: unknown;
+    };
+
+    try {
+      const deliverable = researchBriefDeliverableSchema.parse(payload.deliverable ?? parsed);
+      const cacheKey = typeof payload.cacheKey === "string" ? payload.cacheKey : "";
+      const runId = typeof payload.runId === "string" ? payload.runId : "";
+      if (!cacheKey || !runId) continue;
+      briefs.push({
+        deliverable,
+        cacheKey,
+        runId,
+        identicalToExisting: Boolean(payload.identicalToExisting),
+      });
+    } catch (error) {
+      console.error("Failed to parse report_research tool output", error);
+    }
+  }
+
+  return briefs;
+};
+
+const extractResearchPlans = (items: AgentInputItem[]): ResearchPlanPart[] => {
+  const plans: ResearchPlanPart[] = [];
+
+  for (const item of items) {
+    const candidate = item as any;
+    if (candidate?.type !== "function_call_result" || candidate?.name !== "report_research_plan") continue;
+
+    const output = candidate.output ?? candidate.result ?? candidate.data ?? candidate.content;
+    const parsed = safeParseJSON(
+      typeof output === "string"
+        ? output
+        : (output?.text ?? output?.output_text ?? output),
+    );
+
+    if (!parsed || typeof parsed !== "object") continue;
+    const payload = parsed as { plan?: unknown; runId?: unknown };
+
+    try {
+      const plan = researchPlanSchema.parse(payload.plan ?? parsed);
+      const runId = typeof payload.runId === "string" ? payload.runId : "";
+      plans.push({ plan, runId });
+    } catch (error) {
+      console.error("Failed to parse report_research_plan output", error);
+    }
+  }
+
+  return plans;
+};
+
+const buildReasoningSteps = (
   userText: string,
   toolCalls: ToolInteraction[],
-  deliverable: EmailDraftDeliverable | undefined,
+  emailDeliverables: EmailDraftDeliverable[],
+  researchDeliverables: ResearchBriefPart[],
 ): ReasoningStep[] => {
   const steps: ReasoningStep[] = [];
 
   if (userText) {
-    const preview = userText.length > 160 ? `${userText.slice(0, 157)}…` : userText;
+    const preview = userText.length > 160 ? `${userText.slice(0, 157)}` : userText;
     steps.push({
       title: "Understand operator request",
-      detail: normalizeDetail(`Parsed the latest prompt: “${preview}”`),
+      detail: normalizeWhitespace(`Parsed the latest prompt: ${preview}`),
     });
   }
 
   const draftCall = toolCalls.find((call) => call.name === "draft_email");
   if (draftCall) {
-    const argsSummary = (() => {
-      const args = draftCall.arguments as Record<string, unknown> | undefined;
-      if (!args || typeof args !== "object") return undefined;
-      const { recipient, tone, keyPoints } = args as {
-        recipient?: string;
-        tone?: string;
-        keyPoints?: unknown;
-      };
-      const points = Array.isArray(keyPoints) ? keyPoints.length : undefined;
-      const parts: string[] = [];
-      if (recipient && typeof recipient === "string") parts.push(`recipient ${recipient}`);
-      if (tone && typeof tone === "string") parts.push(`tone ${tone}`);
-      if (typeof points === "number") parts.push(`${points} key points`);
-      return parts.join(", ");
-    })();
+    const args = draftCall.arguments as Record<string, unknown> | undefined;
+    const summaryParts: string[] = [];
+    const recipient = typeof args?.recipient === "string" ? args.recipient : undefined;
+    const tone = typeof args?.tone === "string" ? args.tone : undefined;
+    const keyPoints = Array.isArray(args?.keyPoints) ? (args.keyPoints as unknown[]) : undefined;
+
+    if (recipient) summaryParts.push(`recipient ${recipient}`);
+    if (tone) summaryParts.push(`tone ${tone}`);
+    if (keyPoints) summaryParts.push(`${keyPoints.length} key points`);
 
     steps.push({
       title: "Delegate to drafting specialist",
-      detail: normalizeDetail(
-        argsSummary
-          ? `Called draft_email with ${argsSummary}.`
+      detail: normalizeWhitespace(
+        summaryParts.length > 0
+          ? `Called draft_email with ${summaryParts.join(", ")}.`
           : "Triggered draft_email with structured context.",
       ),
     });
   }
 
-  if (deliverable) {
-    const { metadata, variants, subject } = deliverable;
-    const variantCount = Array.isArray(variants) ? variants.length : 0;
-    const keyPointCount = Array.isArray(metadata?.keyPoints) ? metadata.keyPoints.length : 0;
+  const webSearchCalls = toolCalls.filter((call) => call.name === "web_search");
+  if (webSearchCalls.length > 0) {
+    const latest = webSearchCalls[webSearchCalls.length - 1]?.arguments as { query?: string } | undefined;
+    steps.push({
+      title: "Investigate public sources",
+      detail: normalizeWhitespace(
+        latest?.query
+          ? `Analysed ${webSearchCalls.length} search sweeps. Latest query ${latest.query}.`
+          : `Analysed ${webSearchCalls.length} search sweeps across the public web.`,
+      ),
+    });
+  }
+
+  if (emailDeliverables[0]) {
+    const deliverable = emailDeliverables[0];
+    const variantCount = Array.isArray(deliverable.variants) ? deliverable.variants.length : 0;
+    const keyPointCount = Array.isArray(deliverable.metadata?.keyPoints)
+      ? (deliverable.metadata.keyPoints as unknown[]).length
+      : 0;
     steps.push({
       title: "Assemble final response",
-      detail: normalizeDetail(
-        `Prepared subject “${subject}”, rephrased ${variantCount + 1} variants, and reflected ${keyPointCount} key points.`,
+      detail: normalizeWhitespace(
+        `Prepared subject ${deliverable.subject}, surfaced ${variantCount + 1} variants, and reflected ${keyPointCount} key points.`,
+      ),
+    });
+  }
+
+  if (researchDeliverables[0]) {
+    const brief = researchDeliverables[0].deliverable;
+    steps.push({
+      title: "Synthesize research brief",
+      detail: normalizeWhitespace(
+        `Compiled ${brief.keyFindings.length} findings with ${brief.recommendations.length} recommended actions for ${brief.topic}.`,
       ),
     });
   }
@@ -208,94 +402,66 @@ const buildReasoning = (
 };
 
 const buildSources = (
-  deliverable: EmailDraftDeliverable | undefined,
+  emailDeliverables: EmailDraftDeliverable[],
+  researchDeliverables: ResearchBriefPart[],
   toolCalls: ToolInteraction[],
   threadId: string,
 ): SourceItem[] => {
-  if (!deliverable) return [];
+  const sources: SourceItem[] = [];
 
-  const keyPoints = Array.isArray(deliverable.metadata?.keyPoints)
-    ? (deliverable.metadata?.keyPoints as string[])
-    : [];
+  if (emailDeliverables[0]) {
+    const deliverable = emailDeliverables[0];
+    const keyPoints = Array.isArray(deliverable.metadata?.keyPoints)
+      ? (deliverable.metadata.keyPoints as string[])
+      : [];
 
-  const sourcesFromKeyPoints: SourceItem[] = keyPoints.map((point, index) => ({
-    id: `${deliverable.runId ?? threadId}-kp-${index}`,
-    title: point,
-    description: "Key point supplied by the operator",
-    url: `https://sidekick.local/runs/${deliverable.runId ?? threadId}#kp-${index + 1}`,
-    badge: "Operator context",
-  }));
+    keyPoints.forEach((point, index) => {
+      sources.push({
+        id: `${deliverable.runId ?? threadId}-kp-${index}`,
+        title: point,
+        description: "Key point supplied by the operator",
+        url: `https://sidekick.local/runs/${deliverable.runId ?? threadId}#kp-${index + 1}`,
+        badge: "Operator context",
+      });
+    });
 
-  const draftCall = toolCalls.find((call) => call.name === "draft_email");
-  const toolSource: SourceItem[] = draftCall
-    ? [
-        {
-          id: `${deliverable.runId ?? threadId}-tool-${draftCall.id}`,
-          title: "Draft email specialist",
-          description: "Specialist agent synthesis for email formatting",
-          url: `https://sidekick.local/runs/${deliverable.runId ?? threadId}`,
-          badge: "Specialist",
-        },
+    const draftCall = toolCalls.find((call) => call.name === "draft_email");
+    if (draftCall) {
+      sources.push({
+        id: `${deliverable.runId ?? threadId}-tool-${draftCall.id}`,
+        title: "Draft email specialist",
+        description: "Specialist agent synthesis for email formatting",
+        url: `https://sidekick.local/runs/${deliverable.runId ?? threadId}`,
+        badge: "Specialist",
+      });
+    }
+  }
+
+  for (const part of researchDeliverables) {
+    part.deliverable.sources.forEach((source, index) => {
+      const description = [
+        source.description,
+        source.publishedAt ? `Published ${source.publishedAt}` : undefined,
       ]
-    : [];
+        .filter(Boolean)
+        .join("  ");
 
-  return [...sourcesFromKeyPoints, ...toolSource];
-};
-
-const extractDeliverableParts = (items: AgentInputItem[]): EmailDraftPart[] | undefined => {
-  const deliverables: EmailDraftDeliverable[] = [];
-
-  for (const item of items) {
-    if ((item as any).type !== "function_call_result" || (item as any).name !== "draft_email") continue;
-
-    const output = (item as any).output;
-    let parsed: any;
-
-    if (typeof output === "string") {
-      try {
-        parsed = JSON.parse(output);
-      } catch (error) {
-        console.error("Failed to parse draft_email tool output", error);
-        continue;
-      }
-    } else if (output && typeof output === "object") {
-      if ((output as any).type === "text" && typeof (output as any).text === "string") {
-        try {
-          parsed = JSON.parse((output as any).text);
-        } catch (error) {
-          console.error("Failed to parse draft_email tool output", error);
-          continue;
-        }
-      } else {
-        parsed = output;
-      }
-    }
-
-    if (parsed?.subject && parsed?.body) {
-      deliverables.push(parsed);
-    }
+      sources.push({
+        id: source.id ?? `${part.runId}-source-${index}`,
+        title: source.title,
+        description: description || undefined,
+        url: source.url,
+        badge: source.badge ?? "Research source",
+      });
+    });
   }
 
-  if (deliverables.length === 0) return undefined;
-  return deliverables.map((deliverable) => ({ type: "email-draft" as const, deliverable }));
-};
-
-const writeTextChunks = (
-  writer: { write: (chunk: any) => void },
-  id: string,
-  text: string,
-) => {
-  if (!text) return;
-  const normalized = text.replace(/\r\n/g, "\n");
-  if (!normalized.trim()) {
-    writer.write({ type: "text-delta", id, delta: normalized });
-    return;
-  }
-  const chunkSize = 300;
-  for (let index = 0; index < normalized.length; index += chunkSize) {
-    const delta = normalized.slice(index, index + chunkSize);
-    writer.write({ type: "text-delta", id, delta });
-  }
+  const seen = new Set<string>();
+  return sources.filter((source) => {
+    if (seen.has(source.id)) return false;
+    seen.add(source.id);
+    return true;
+  });
 };
 
 export async function POST(request: NextRequest) {
@@ -310,10 +476,9 @@ export async function POST(request: NextRequest) {
     }
 
     const { id: threadId, session } = getOrCreateSession(payload?.threadId ?? "default-thread");
-    const userItem = toUserMessage(userText);
     const apiKey = process.env.OPENAI_API_KEY;
 
-    const stream = createUIMessageStream<OrchestratorUIMessage>({
+    const stream = createUIMessageStream({
       execute: async ({ writer }) => {
         const messageId = `assistant-text-${Date.now()}`;
         writer.write({ type: "text-start", id: messageId });
@@ -323,6 +488,8 @@ export async function POST(request: NextRequest) {
           if (closed) return;
           closed = true;
           writer.write({ type: "text-end", id: messageId });
+          const closable = writer as { close?: () => void };
+          closable.close?.();
         };
 
         if (!apiKey) {
@@ -339,7 +506,7 @@ export async function POST(request: NextRequest) {
           const provider = new OpenAIProvider({ apiKey });
           const runner = new Runner({
             modelProvider: provider,
-            model: "gpt-5",
+            model: "gpt-5-mini",
             modelSettings: {
               reasoning: { effort: "low" },
               text: { verbosity: "low" },
@@ -351,75 +518,195 @@ export async function POST(request: NextRequest) {
             },
           });
 
-          const historyWithUser = [...session.history, userItem];
-          const result = await runner.run(orchestratorAgent, historyWithUser, { context: session.context });
-          const history = result.history;
-          updateSessionHistory(threadId, history);
+          const historyWithUser = [...session.history, toUserMessage(userText)];
+          const run = await runner.run(orchestratorAgent, historyWithUser, {
+            context: session.context,
+            stream: true,
+          });
 
-          const newItemsStartIndex = historyWithUser.length;
-          const newItems = history.slice(newItemsStartIndex);
-          const assistantMessages = newItems
-            .map((item) => extractAssistantText(item))
-            .filter((text) => text.length > 0);
+          let textDelivered = false;
+          const reasoningId = `${messageId}-reasoning`;
+          const reasoningBuffer = new Map<string, string>();
 
-          const textResponse = assistantMessages.join("\n\n");
-          if (textResponse) {
-            writeTextChunks(writer, messageId, textResponse);
-          } else {
-            writer.write({ type: "text-delta", id: messageId, delta: "No assistant response generated." });
-          }
-
-          const deliverableParts = extractDeliverableParts(newItems);
-          const toolInteractions = extractToolInteractions(newItems);
-          const primaryDeliverable = deliverableParts?.[0]?.deliverable;
-
-          const reasoningSteps = buildReasoning(userText, toolInteractions, primaryDeliverable);
-          if (reasoningSteps.length > 0) {
+          const emitReasoningUpdate = (status: "in-progress" | "completed") => {
+            if (reasoningBuffer.size === 0) return;
+            const steps = Array.from(reasoningBuffer.values()).map((detail, index) => ({
+              title: `Thought ${index + 1}`,
+              detail: normalizeWhitespace(detail),
+            }));
             writer.write({
               type: "data-reasoning",
-              id: `${messageId}-reasoning`,
+              id: reasoningId,
               data: {
-                headline: "How the orchestrator responded",
-                steps: reasoningSteps,
+                headline: status === "in-progress" ? "Investigating" : "How the orchestrator responded",
+                status,
+                steps,
               },
             });
-          }
+          };
 
-          if (toolInteractions.length > 0) {
-            toolInteractions.forEach((interaction, index) => {
-              writer.write({
-                type: "data-tool",
-                id: `${messageId}-tool-${index}`,
-                data: {
-                  name: interaction.name,
-                  status: interaction.status,
-                  arguments: interaction.arguments,
-                  result: interaction.result,
-                },
-              });
-            });
-          }
+          for await (const event of run) {
+            if (event.type === "raw_model_stream_event") {
+              const data = event.data as any;
+              if (data?.type === "response.output_text.delta" && typeof data.delta === "string") {
+                writer.write({ type: "text-delta", id: messageId, delta: data.delta });
+                textDelivered = true;
+              }
 
-          if (primaryDeliverable) {
-            const sources = buildSources(primaryDeliverable, toolInteractions, threadId);
-            if (sources.length > 0) {
-              writer.write({
-                type: "data-sources",
-                id: `${messageId}-sources`,
-                data: sources,
-              });
+              if (data?.type === "response.error") {
+                const errorMessage = data.error?.message ?? "The model reported an error.";
+                writer.write({ type: "text-delta", id: messageId, delta: `Error: ${errorMessage}` });
+                textDelivered = true;
+                break;
+              }
+            }
+
+            if (event.type === "run_item_stream_event") {
+              const name = (event as any).name as string | undefined;
+              if (name === "reasoning_item_created" || name === "reasoning_item_delta") {
+                const detail = extractReasoningText(event.item);
+                if (detail) {
+                  const key = (event.item as any)?.rawItem?.id ?? `step-${reasoningBuffer.size}`;
+                  reasoningBuffer.set(key, detail);
+                  emitReasoningUpdate("in-progress");
+                }
+              }
+
+              if (name === "reasoning_summary" && typeof (event.item as any)?.summary === "string") {
+                reasoningBuffer.set(`summary-${reasoningBuffer.size}`, (event.item as any).summary);
+                emitReasoningUpdate("in-progress");
+              }
             }
           }
 
-          if (deliverableParts?.length) {
-            deliverableParts.forEach((part, index) => {
-              writer.write({
-                type: "data-email-draft",
-                id: `${messageId}-email-${index}`,
-                data: part.deliverable,
-              });
+          await run.completed;
+
+          const history = run.history;
+          updateSessionHistory(threadId, history);
+
+          const newItems = history.slice(historyWithUser.length);
+          const toolInteractions = extractToolInteractions(newItems);
+          const emailDeliverables = extractEmailDeliverables(newItems);
+          const researchPlans = extractResearchPlans(newItems);
+          const researchDeliverables = extractResearchDeliverables(newItems);
+
+          if (!textDelivered) {
+            const fallbackText = collectAssistantText(newItems);
+            if (fallbackText) {
+              writeTextChunks(writer, messageId, fallbackText);
+              textDelivered = fallbackText.length > 0;
+            }
+          }
+
+          if (!textDelivered) {
+            writer.write({ type: "text-delta", id: messageId, delta: "No assistant response generated." });
+          }
+
+          emitReasoningUpdate("completed");
+
+          toolInteractions.forEach((interaction, index) => {
+            writer.write({
+              type: "data-tool",
+              id: `${messageId}-tool-${index}`,
+              data: {
+                name: interaction.name,
+                status: interaction.status,
+                arguments: interaction.arguments,
+                result: interaction.result,
+              },
+            });
+          });
+
+          const sources = buildSources(emailDeliverables, researchDeliverables, toolInteractions, threadId);
+          if (sources.length > 0) {
+            writer.write({
+              type: "data-sources",
+              id: `${messageId}-sources`,
+              data: sources,
             });
           }
+
+          researchPlans.forEach((part, index) => {
+            writer.write({
+              type: "data-research-plan",
+              id: `${messageId}-research-plan-${index}`,
+              data: {
+                objective: part.plan.objective,
+                constraints: part.plan.constraints ?? [],
+                tasks: part.plan.tasks.map((task, taskIndex) => ({
+                  id: `${part.runId}-task-${taskIndex}`,
+                  title: task.title,
+                  detail: task.detail,
+                  modality: task.modality ?? null,
+                  successCriteria: task.successCriteria ?? null,
+                })),
+                budgets: {
+                  webSearches: part.plan.budgets?.webSearches ?? null,
+                  fileSearches: part.plan.budgets?.fileSearches ?? null,
+                  followUpIterations: part.plan.budgets?.followUpIterations ?? null,
+                  timeboxMinutes: part.plan.budgets?.timeboxMinutes ?? null,
+                  notes: part.plan.budgets?.notes ?? null,
+                },
+                recencyWindow: part.plan.recencyWindow ?? null,
+                openQuestions: part.plan.openQuestions ?? [],
+                deliverableExpectation: part.plan.deliverableExpectation ?? null,
+                metadata: part.plan.metadata ?? {},
+                runId: part.runId,
+              },
+            });
+          });
+
+          emailDeliverables.forEach((deliverable, index) => {
+            writer.write({
+              type: "data-email-draft",
+              id: `${messageId}-email-${index}`,
+              data: {
+                subject: deliverable.subject,
+                body: deliverable.body,
+                variants: deliverable.variants,
+                metadata: deliverable.metadata,
+                cacheKey: deliverable.cacheKey,
+                runId: deliverable.runId,
+                identicalToExisting: deliverable.identicalToExisting,
+              },
+            });
+          });
+
+          researchDeliverables.forEach((part, index) => {
+            writer.write({
+              type: "data-research-brief",
+              id: `${messageId}-research-${index}`,
+              data: {
+                topic: part.deliverable.topic,
+                summary: part.deliverable.summary,
+                keyFindings: part.deliverable.keyFindings.map((finding) => ({
+                  title: finding.title,
+                  insight: finding.insight,
+                  confidence: finding.confidence ?? null,
+                  citations: finding.citations ?? [],
+                })),
+                recommendations: part.deliverable.recommendations.map((recommendation) => ({
+                  action: recommendation.action,
+                  rationale: recommendation.rationale ?? null,
+                  priority: recommendation.priority ?? null,
+                  citations: recommendation.citations ?? [],
+                })),
+                followUps: part.deliverable.followUps ?? [],
+                sources: part.deliverable.sources.map((source) => ({
+                  id: source.id,
+                  title: source.title,
+                  description: source.description ?? null,
+                  url: source.url ?? null,
+                  badge: source.badge ?? null,
+                  publishedAt: source.publishedAt ?? null,
+                })),
+                metadata: part.deliverable.metadata ?? {},
+                cacheKey: part.cacheKey,
+                runId: part.runId,
+                identicalToExisting: part.identicalToExisting,
+              },
+            });
+          });
         } catch (error) {
           console.error("Chat orchestrator failed.", error);
           const errorMessage = error instanceof Error ? error.message : String(error);
@@ -436,4 +723,3 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Chat orchestrator failed." }, { status: 500 });
   }
 }
-

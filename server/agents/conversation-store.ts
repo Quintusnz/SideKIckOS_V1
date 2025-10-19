@@ -16,7 +16,11 @@ export const getOrCreateSession = (threadId?: string) => {
     return { id, session: existing };
   }
 
-  const context = createRuntimeContext({ threadId: id });
+  const context = createRuntimeContext({
+    threadId: id,
+    workflowId: "conversation-workbench",
+    intent: "orchestrator-chat",
+  });
   const session: SessionState = { context, history: [] };
   sessions.set(id, session);
   return { id, session };

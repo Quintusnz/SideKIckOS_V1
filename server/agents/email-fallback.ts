@@ -159,7 +159,12 @@ export const runEmailDraftFallback = async (
   input: EmailDraftAgentInput,
   runtimeOverrides: Partial<Omit<EmailAgentRuntimeContext, "payload">> = {},
 ): Promise<EmailAgentRunResult> => {
-  const context = createRuntimeContext({ payload: input, ...runtimeOverrides });
+  const context = createRuntimeContext({
+    payload: input,
+    workflowId: "email-draft",
+    intent: "compose-email",
+    ...runtimeOverrides,
+  });
   const deliverable = buildDeliverable(input, context);
   const outcome = reportEmailDraft(deliverable, { runId: context.runId });
   return { ...outcome, context };

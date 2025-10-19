@@ -1,22 +1,24 @@
 ﻿import { randomUUID } from "crypto";
-import type { EmailDraftAgentInput } from "@/models/email";
-
-export type EmailAgentRuntimeContext = {
+export type SidekickAgentRuntimeContext = {
   runId: string;
   threadId?: string;
   workflowId: string;
   intent: string;
   createdAt: string;
-  payload?: EmailDraftAgentInput;
+  payload?: unknown;
+  metadata?: Record<string, unknown>;
 };
 
+export type EmailAgentRuntimeContext = SidekickAgentRuntimeContext;
+
 type RuntimeOptions = {
-  payload?: EmailDraftAgentInput;
+  payload?: unknown;
   runId?: string;
   threadId?: string;
   workflowId?: string;
   intent?: string;
   createdAt?: string;
+  metadata?: Record<string, unknown>;
 };
 
 export const createRuntimeContext = ({
@@ -26,13 +28,15 @@ export const createRuntimeContext = ({
   workflowId,
   intent,
   createdAt,
+  metadata,
 }: RuntimeOptions): EmailAgentRuntimeContext => ({
   runId: runId ?? randomUUID(),
   threadId,
-  workflowId: workflowId ?? "email-draft",
-  intent: intent ?? "compose-email",
+  workflowId: workflowId ?? "sidekick-orchestrator",
+  intent: intent ?? "assist",
   createdAt: createdAt ?? new Date().toISOString(),
   payload,
+  metadata,
 });
 
 export const resolveContext = (value: unknown): EmailAgentRuntimeContext | undefined => {
@@ -42,10 +46,11 @@ export const resolveContext = (value: unknown): EmailAgentRuntimeContext | undef
   return {
     runId: ctx.runId,
     threadId: ctx.threadId,
-    workflowId: ctx.workflowId ?? "email-draft",
-    intent: ctx.intent ?? "compose-email",
+    workflowId: ctx.workflowId ?? "sidekick-orchestrator",
+    intent: ctx.intent ?? "assist",
     createdAt: ctx.createdAt ?? new Date().toISOString(),
     payload: ctx.payload,
+    metadata: ctx.metadata,
   };
 };
 
